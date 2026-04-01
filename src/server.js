@@ -385,68 +385,6 @@ const setupRateLimiter = {
   },
 };
 
-const SESSION_SECRET = crypto.randomBytes(32);
-
-function signSessionToken() {
-  const payload = `setup:${Date.now()}`;
-  const sig = crypto
-    .createHmac("sha256", SESSION_SECRET)
-    .update(payload)
-    .digest("hex");
-  return `${payload}.${sig}`;
-}
-
-function verifySessionToken(token) {
-  if (!token) return false;
-  const dotIdx = token.lastIndexOf(".");
-  if (dotIdx < 0) return false;
-  const payload = token.slice(0, dotIdx);
-  const sig = token.slice(dotIdx + 1);
-  const expected = crypto
-    .createHmac("sha256", SESSION_SECRET)
-    .update(payload)
-    .digest("hex");
-  if (sig.length !== expected.length) return false;
-  return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
-}
-
-function setSessionCookie(res, token) {
-  res.set(
-    "Set-Cookie",
-    `openclaw_setup=${token}; Path=/setup; HttpOnly; SameSite=Lax; Max-Age=86400${
-      process.env.RAILWAY_PUBLIC_DOMAIN ? "; Secure" : ""
-    }`,
-  );
-}
-
-function getSessionCookie(req) {
-  const cookies = req.headers.cookie || "";
-  const match = cookies.match(/(?:^|;\s*)openclaw_setup=([^;]+)/);
-  return match ? match[1] : null;
-}
-
-function verifySetupPassword(req) {
-  const header = req.headers.authorization || "";
-  const [scheme, encoded] = header.split(" ");
-  if (scheme !== "Basic" || !encoded) return "missing";
-  const decoded = Buffer.from(encoded, "base64").toString("utf8");
-  const idx = decoded.indexOf(":");
-  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto
-    .createHash("sha256")
-    .update(SETUP_PASSWORD)
-    .digest();
-  return crypto.timingSafeEqual(passwordHash, expectedHash)
-    ? "valid"
-    : "invalid";
-}
-
-function isSetupAuthenticated(req) {
-  if (verifySetupPassword(req) === "valid") return true;
-  return verifySessionToken(getSessionCookie(req));
-}
-
 function requireSetupAuth(req, res, next) {
   if (!SETUP_PASSWORD) {
     return res
@@ -462,10 +400,23 @@ function requireSetupAuth(req, res, next) {
     return res.status(429).type("text/plain").send("Too many requests. Try again later.");
   }
 
-  if (isSetupAuthenticated(req)) return next();
-
-  res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
-  return res.status(401).send("Auth required");
+  const header = req.headers.authorization || "";
+  const [scheme, encoded] = header.split(" ");
+  if (scheme !== "Basic" || !encoded) {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+    return res.status(401).send("Auth required");
+  }
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  const password = idx >= 0 ? decoded.slice(idx + 1) : "";
+  const passwordHash = crypto.createHash("sha256").update(password).digest();
+  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
+  const isValid = crypto.timingSafeEqual(passwordHash, expectedHash);
+  if (!isValid) {
+    res.set("WWW-Authenticate", 'Basic realm="OpenClaw Setup"');
+    return res.status(401).send("Invalid password");
+  }
+  return next();
 }
 
 const app = express();
@@ -510,47 +461,8 @@ app.get("/setup/healthz", async (_req, res) => {
   });
 });
 
-app.get("/setup", (req, res) => {
-  if (!SETUP_PASSWORD) {
-    return res
-      .status(500)
-      .type("text/plain")
-      .send(
-        "SETUP_PASSWORD is not set. Set it in Railway Variables before using /setup.",
-      );
-  }
-
-  if (isSetupAuthenticated(req)) {
-    return res.sendFile(
-      path.join(process.cwd(), "src", "public", "setup.html"),
-    );
-  }
-
-  return res.sendFile(
-    path.join(process.cwd(), "src", "public", "login.html"),
-  );
-});
-
-app.post("/setup/api/login", (req, res) => {
-  if (!SETUP_PASSWORD) {
-    return res.status(500).json({ ok: false, error: "SETUP_PASSWORD is not set." });
-  }
-
-  const ip = req.ip || req.socket?.remoteAddress || "unknown";
-  if (setupRateLimiter.isRateLimited(ip)) {
-    return res.status(429).json({ ok: false, error: "Too many attempts. Try again later." });
-  }
-
-  const password = (req.body?.password || "").toString();
-  const passwordHash = crypto.createHash("sha256").update(password).digest();
-  const expectedHash = crypto.createHash("sha256").update(SETUP_PASSWORD).digest();
-  if (!crypto.timingSafeEqual(passwordHash, expectedHash)) {
-    return res.status(401).json({ ok: false, error: "Invalid password." });
-  }
-
-  const token = signSessionToken();
-  setSessionCookie(res, token);
-  return res.json({ ok: true });
+app.get("/setup", requireSetupAuth, (_req, res) => {
+  res.sendFile(path.join(process.cwd(), "src", "public", "setup.html"));
 });
 
 app.get("/setup/api/status", requireSetupAuth, async (_req, res) => {
